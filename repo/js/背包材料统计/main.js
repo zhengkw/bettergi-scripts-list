@@ -2143,46 +2143,110 @@ function classifyNormalPathFiles(pathingDir, targetResourceNames, lowCountMateri
  * @param {string} imagesDir - 图像目录
  * @returns {Object} { allPaths, pathingMaterialCounts }
  */
+
 async function generateAllPaths(pathingDir, targetResourceNames, cdMaterialNames, materialCategoryMap, pathingMode, imagesDir) {
-  // 缓存路径文件列表（减少IO）
+  // ========== 预处理阶段：构建索引映射（用空间换时间）==========
+
   const pathingFilePaths = readAllFilePaths(pathingDir, 0, 3, ['.json']);
   const pathEntries = pathingFilePaths.map(path => {
-    const { materialName, monsterName } = extractResourceNameFromPath(path, cdMaterialNames);
-    return { path, resourceName: materialName, monsterName };
+    const {materialName, monsterName} = extractResourceNameFromPath(path, cdMaterialNames);
+    return {path, resourceName: materialName, monsterName};
   }).filter(entry => (entry.resourceName || entry.monsterName) && entry.path.trim() !== "");
 
   log.info(`${CONSTANTS.LOG_MODULES.PATH}[路径初始化] 共读取有效路径 ${pathEntries.length} 条`);
 
-  // 分类路径（狗粮 > 怪物 > 普通材料）
+  // 1. 材料名到路径的映射（避免重复遍历）
+  const materialToPathMap = {
+    food: new Map(),      // 材料名 → 狗粮路径数组
+    monster: new Map(),   // 材料名 → 怪物路径数组
+    normal: new Map()     // 材料名 → 普通路径数组
+  };
+
+  // 2. 怪物名到其掉落材料的映射（快速查找）
+  const monsterToMaterialsSet = {}; // 怪物名 → Set(材料名)
+
+  // 3. 优先级材料集合（用于第二梯队快速判断）
+  const priorityMaterialSet = new Set();
+  const priorityMonsterSet = new Set();
+
+  // ========== 构建索引 ==========
+
+  log.info(`${CONSTANTS.LOG_MODULES.PATH}[索引构建] 开始建立材料 - 路径映射关系...`);
+
+  // 处理狗粮路径
   const foodPaths = pathEntries.filter(entry => entry.resourceName && isFoodResource(entry.resourceName));
+  foodPaths.forEach(entry => {
+    if (!materialToPathMap.food.has(entry.resourceName)) {
+      materialToPathMap.food.set(entry.resourceName, []);
+    }
+    materialToPathMap.food.get(entry.resourceName).push(entry);
+  });
+
+  // 处理怪物路径
   const monsterPaths = pathEntries.filter(entry => entry.monsterName && !isFoodResource(entry.resourceName));
+  monsterPaths.forEach(entry => {
+    const monsterName = entry.monsterName;
+    const materials = monsterToMaterials[monsterName] || [];
+
+    // 构建怪物→材料 Set 映射
+    if (!monsterToMaterialsSet[monsterName]) {
+      monsterToMaterialsSet[monsterName] = new Set(materials);
+    }
+
+    // 将路径加入每个对应材料的索引
+    materials.forEach(mat => {
+      if (!materialToPathMap.monster.has(mat)) {
+        materialToPathMap.monster.set(mat, []);
+      }
+      if (!materialToPathMap.monster.get(mat).includes(entry)) {
+        materialToPathMap.monster.get(mat).push(entry);
+      }
+    });
+  });
+
+  // 处理普通路径
   const normalPaths = pathEntries.filter(entry => entry.resourceName && !isFoodResource(entry.resourceName) && !entry.monsterName);
+  normalPaths.forEach(entry => {
+    if (!materialToPathMap.normal.has(entry.resourceName)) {
+      materialToPathMap.normal.set(entry.resourceName, []);
+    }
+    materialToPathMap.normal.get(entry.resourceName).push(entry);
+  });
+
+  // 标记优先级材料和怪物
+  targetResourceNames.forEach(name => {
+    if (monsterToMaterials.hasOwnProperty(name)) {
+      priorityMonsterSet.add(name);
+      // 怪物对应的材料也标记为优先级
+      (monsterToMaterials[name] || []).forEach(mat => priorityMaterialSet.add(mat));
+    } else {
+      priorityMaterialSet.add(name);
+    }
+  });
 
   log.info(`${CONSTANTS.LOG_MODULES.PATH}[路径分类] 狗粮:${foodPaths.length} 怪物:${monsterPaths.length} 普通:${normalPaths.length}`);
+  log.info(`${CONSTANTS.LOG_MODULES.PATH}[索引构建] 完成，覆盖 ${materialToPathMap.food.size + materialToPathMap.monster.size + materialToPathMap.normal.size} 种材料`);
 
-  // 怪物路径关联材料到分类（扫描用）- 仅includeBoth和onlyPathing模式
+  // 怪物路径关联材料到分类（扫描用）- 仅 includeBoth 和 onlyPathing 模式
   if (pathingMode.includeBoth || pathingMode.onlyPathing) {
     log.info(`${CONSTANTS.LOG_MODULES.MONSTER}开始处理${monsterPaths.length}条怪物路径的材料分类关联...`);
     monsterPaths.forEach((entry, index) => {
       const materials = monsterToMaterials[entry.monsterName] || [];
       if (materials.length === 0) {
-        log.warn(`${CONSTANTS.LOG_MODULES.MONSTER}[怪物路径${index+1}] 怪物【${entry.monsterName}】无对应材料映射`);
+        log.warn(`${CONSTANTS.LOG_MODULES.MONSTER}[怪物路径${index + 1}] 怪物【${entry.monsterName}】无对应材料映射`);
         return;
       }
       materials.forEach(mat => {
-        // 添加到pathing怪物材料集合（用于OCR过滤）
         ocrContext.pathingMonsterMaterials.add(mat);
-
         const category = matchImageAndGetCategory(mat, imagesDir);
         if (!category) return;
         if (!materialCategoryMap[category]) materialCategoryMap[category] = [];
         if (!materialCategoryMap[category].includes(mat)) {
           materialCategoryMap[category].push(mat);
-          // log.debug(`${CONSTANTS.LOG_MODULES.MONSTER}怪物【${entry.monsterName}】的材料【${mat}】加入分类【${category}】`);
         }
       });
     });
-    if (debugLog) log.info(`${CONSTANTS.LOG_MODULES.MONSTER}pathing文件夹中的怪物材料共${ocrContext.pathingMonsterMaterials.size}种：${Array.from(ocrContext.pathingMonsterMaterials).join('、')}`);
+    if (debugLog) log.info(`${CONSTANTS.LOG_MODULES.MONSTER}pathing 文件夹中的怪物材料共${ocrContext.pathingMonsterMaterials.size}种：${Array.from(ocrContext.pathingMonsterMaterials).join('、')}`);
   }
 
   let processedFoodPaths = foodPaths;
@@ -2191,23 +2255,18 @@ async function generateAllPaths(pathingDir, targetResourceNames, cdMaterialNames
   let pathingMaterialCounts = [];
 
   if (normalPaths.length > 0 || monsterPaths.length > 0) {
-    // 优化：一次扫描获取全量材料数量，同时服务于怪物和普通材料
-    // 优化：使用缓存获取材料数量
     log.info(`${CONSTANTS.LOG_MODULES.PATH}[材料扫描] 获取背包数据...`);
     const allMaterialCounts = await ColdStartCache.getInitialSnapshot(materialCategoryMap);
     pathingMaterialCounts = allMaterialCounts;
 
-    // 筛选低数量材料（同时生成超量名单）
     if (debugLog) log.info(`${CONSTANTS.LOG_MODULES.MONSTER}[怪物材料] 基于全量扫描结果筛选有效材料`);
     const filteredMaterials = filterLowCountMaterials(allMaterialCounts.flat(), materialCategoryMap);
     const validMonsterMaterialNames = filteredMaterials.map(m => m.name);
     if (debugLog) log.info(`${CONSTANTS.LOG_MODULES.MONSTER}[怪物材料] 筛选后有效材料：${validMonsterMaterialNames.join('、')}`);
 
-    // 普通材料筛选
     if (pathingMode.onlyCategory) {
-      return { allPaths: [], pathingMaterialCounts };
+      return {allPaths: [], pathingMaterialCounts};
     }
-    // log.info(`${CONSTANTS.LOG_MODULES.PATH}[普通材料] 基于全量扫描结果筛选低数量材料`);
     const lowCountMaterialsFiltered = filteredMaterials;
     const flattenedLowCountMaterials = lowCountMaterialsFiltered.flat().sort((a, b) => a.count - b.count);
     const lowCountMaterialNames = flattenedLowCountMaterials.map(material => material.name);
@@ -2217,59 +2276,150 @@ async function generateAllPaths(pathingDir, targetResourceNames, cdMaterialNames
     if (debugLog) log.info(`${CONSTANTS.LOG_MODULES.PATH}[普通材料] 筛选后保留路径 ${processedNormalPaths.length} 条`);
   }
 
-  // 路径优先级规则数组
-  const PATH_PRIORITIES = [
-    // 1. 目标狗粮
-    {
-      source: processedFoodPaths,
-      filter: e => targetResourceNames.includes(e.resourceName)
-    },
-    // 2. 目标怪物（掉落材料含目标）
-    {
-      source: processedMonsterPaths,
-      filter: e => {
-        const materials = monsterToMaterials[e.monsterName] || [];
-        return materials.some(mat => targetResourceNames.includes(mat));
-      }
-    },
-    // 3. 目标普通材料
-    {
-      source: processedNormalPaths,
-      filter: e => targetResourceNames.includes(e.resourceName)
-    },
-    // 4. 剩余狗粮
-    {
-      source: processedFoodPaths,
-      filter: e => !targetResourceNames.includes(e.resourceName)
-    },
-    // 5. 剩余怪物（掉落材料未超量且低数量）
-    {
-      source: processedMonsterPaths,
-      filter: e => {
-        const materials = monsterToMaterials[e.monsterName] || [];
-        return !materials.some(mat => targetResourceNames.includes(mat)) &&
-            materials.some(mat => !excessMaterialNames.includes(mat));
-      }
-    },
-    // 6. 剩余普通材料
-    {
-      source: processedNormalPaths,
-      filter: e => !targetResourceNames.includes(e.resourceName)
-    }
-  ];
-
-  // 按优先级合并路径
+  // ==============================================
+  // 【第一梯队】按用户输入顺序分组批量执行（Map 索引优化 + 完整日志）
+  // ==============================================
   const allPaths = [];
-  PATH_PRIORITIES.forEach(({ source, filter }, index) => {
-    const filtered = source.filter(filter);
-    allPaths.push(...filtered);
-    log.info(`${CONSTANTS.LOG_MODULES.PATH}[优先级${index+1}] 路径 ${filtered.length} 条`);
+
+  if (targetResourceNames.length > 0) {
+    log.info(`${CONSTANTS.LOG_MODULES.PATH}═══════════════════════════════════════`);
+    log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级] 开始按输入顺序分组批量处理`);
+    log.info(`${CONSTANTS.LOG_MODULES.PATH}═══════════════════════════════════════`);
+    log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级] 优先级顺序：${targetResourceNames.join(' → ')}`);
+
+    // 按用户输入顺序，依次处理每个目标
+    targetResourceNames.forEach((targetName, userIndex) => {
+      const priorityNum = userIndex + 1;
+      const targetPaths = [];
+
+      const isMonster = monsterToMaterials.hasOwnProperty(targetName);
+
+      if (isMonster) {
+        // >>>>> 情况 A：用户输入的是怪物名 <<<<<
+        log.info(`${CONSTANTS.LOG_MODULES.PATH}───────────────────────────────────────`);
+        log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] 检测到怪物名：【${targetName}】`);
+
+        // 1. 直接找该怪物的所有路径
+        const directMonsterPaths = processedMonsterPaths.filter(e => e.monsterName === targetName);
+        if (directMonsterPaths.length > 0) {
+          targetPaths.push(...directMonsterPaths);
+          log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] ✓ 收集怪物【${targetName}】路径 ${directMonsterPaths.length}条`);
+        } else {
+          log.warn(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] ✗ 未找到怪物【${targetName}】的路径`);
+        }
+
+        // 2. 收集该怪物掉落材料的其他来源路径
+        const monsterMaterials = monsterToMaterials[targetName] || [];
+        if (monsterMaterials.length > 0) {
+          log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] 怪物【${targetName}】掉落材料：${monsterMaterials.join('、')}`);
+
+          // 使用索引快速查找每种材料的路径（O(1) 替代 O(n)）
+          let otherPathCount = 0;
+          monsterMaterials.forEach(mat => {
+            // 普通路径（直接从 Map 获取）
+            const matNormalPaths = materialToPathMap.normal.get(mat) || [];
+            if (matNormalPaths.length > 0) {
+              targetPaths.push(...matNormalPaths);
+              otherPathCount += matNormalPaths.length;
+              if (debugLog) log.debug(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}]   - 材料【${mat}】普通路径 ${matNormalPaths.length}条`);
+            }
+          });
+
+          if (otherPathCount > 0) {
+            log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] ✓ 收集掉落材料的其他路径 ${otherPathCount}条`);
+          }
+        }
+
+      } else {
+        // >>>>> 情况 B：用户输入的是材料名 <<<<<
+        log.info(`${CONSTANTS.LOG_MODULES.PATH}───────────────────────────────────────`);
+        log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] 检测到材料名：【${targetName}】`);
+
+        // 使用索引快速查找（O(1) 替代 O(n)）
+
+        // 2.1 狗粮路径（直接从 Map 获取）
+        const targetFoodPaths = materialToPathMap.food.get(targetName) || [];
+        if (targetFoodPaths.length > 0) {
+          targetPaths.push(...targetFoodPaths);
+          log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] ✓ 收集狗粮【${targetName}】路径 ${targetFoodPaths.length}条`);
+        }
+
+        // 2.2 怪物掉落路径（直接从 Map 获取）
+        const targetMonsterPaths = materialToPathMap.monster.get(targetName) || [];
+        if (targetMonsterPaths.length > 0) {
+          targetPaths.push(...targetMonsterPaths);
+          log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] ✓ 收集怪物掉落【${targetName}】路径 ${targetMonsterPaths.length}条`);
+        }
+
+        // 2.3 普通材料路径（直接从 Map 获取）
+        const targetNormalPaths = materialToPathMap.normal.get(targetName) || [];
+        if (targetNormalPaths.length > 0) {
+          targetPaths.push(...targetNormalPaths);
+          log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] ✓ 收集普通材料【${targetName}】路径 ${targetNormalPaths.length}条`);
+        }
+
+        if (targetPaths.length === 0) {
+          log.warn(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] ✗ 未找到【${targetName}】的任何路径`);
+        }
+      }
+
+      // 3. 将当前目标的所有路径加入队列
+      if (targetPaths.length > 0) {
+        allPaths.push(...targetPaths);
+        log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级 ${priorityNum}] ══> 【${targetName}】共排入 ${targetPaths.length} 条路径`);
+      }
+    });
+
+    log.info(`${CONSTANTS.LOG_MODULES.PATH}───────────────────────────────────────`);
+    log.info(`${CONSTANTS.LOG_MODULES.PATH}[用户优先级] 处理完成，共排入 ${allPaths.length} 条路径`);
+    log.info(`${CONSTANTS.LOG_MODULES.PATH}═══════════════════════════════════════`);
+  }
+
+  // ==============================================
+  // 【第二梯队】剩余非优先级路径（使用 Set 快速判断）
+  // ==============================================
+  const remainingPaths = [];
+
+  // 剩余狗粮（使用 Set 快速排除）
+  const remainingFoodPaths = processedFoodPaths.filter(e => {
+    return !priorityMaterialSet.has(e.resourceName);
   });
+  remainingPaths.push(...remainingFoodPaths);
+  log.info(`${CONSTANTS.LOG_MODULES.PATH}[常规优先级] 剩余狗粮路径 ${remainingFoodPaths.length} 条`);
 
-  // log.info(`${CONSTANTS.LOG_MODULES.PATH}[最终路径] 共${allPaths.length}条：${allPaths.map(p => basename(p.path))}`);
-  return { allPaths, pathingMaterialCounts };
+  // 剩余怪物（使用 Set 快速排除）
+  const remainingMonsterPaths = processedMonsterPaths.filter(e => {
+    // 检查是否是优先级怪物
+    if (priorityMonsterSet.has(e.monsterName)) {
+      return false;
+    }
+
+    // 检查是否掉落优先级材料
+    const materials = monsterToMaterialsSet[e.monsterName] || new Set();
+    for (const mat of priorityMaterialSet) {
+      if (materials.has(mat)) {
+        return false;
+      }
+    }
+
+    const hasValidMaterial = (monsterToMaterials[e.monsterName] || []).some(mat => !excessMaterialNames.includes(mat));
+    return hasValidMaterial;
+  });
+  remainingPaths.push(...remainingMonsterPaths);
+  log.info(`${CONSTANTS.LOG_MODULES.PATH}[常规优先级] 剩余怪物路径 ${remainingMonsterPaths.length} 条`);
+
+  // 剩余普通材料（使用 Set 快速排除）
+  const remainingNormalPaths = processedNormalPaths.filter(e => {
+    return !priorityMaterialSet.has(e.resourceName);
+  });
+  remainingPaths.push(...remainingNormalPaths);
+  log.info(`${CONSTANTS.LOG_MODULES.PATH}[常规优先级] 剩余普通材料路径 ${remainingNormalPaths.length} 条`);
+
+  // 将剩余路径追加到用户优先级路径之后
+  allPaths.push(...remainingPaths);
+
+  log.info(`${CONSTANTS.LOG_MODULES.PATH}[最终路径] 总计${allPaths.length}条（用户指定顺序：${targetResourceNames.length}组）`);
 }
-
 // ==============================================
 // 通知工具
 // ==============================================
